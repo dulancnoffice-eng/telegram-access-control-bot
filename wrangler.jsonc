@@ -8,7 +8,7 @@
     {
       "binding": "DB",
       "database_name": "telegram-access-control",
-      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "database_id": "0fbaa85c-3b2d-4e7a-91a2-8a54e65e4b35",
       "migrations_dir": "migrations"
     }
   ]
