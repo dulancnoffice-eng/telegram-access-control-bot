@@ -5,6 +5,52 @@ import { json, safeError, VERSION } from "./util.js";
 
 const ALLOWED_UPDATES = ["message", "chat_member", "my_chat_member"];
 
+const DEFAULT_COMMANDS = [
+  { command: "whoami", description: "Show your numeric Telegram user ID" },
+];
+
+const OWNER_COMMANDS = [
+  { command: "help", description: "Show all bot commands and what each command does" },
+  { command: "whoami", description: "Show your numeric Telegram user ID" },
+  { command: "groups", description: "List authorized groups you can manage" },
+  { command: "controllers", description: "List owner and global controller IDs" },
+  { command: "authorize", description: "Authorize a group for bot management" },
+  { command: "deauthorize", description: "Stop bot management for a group" },
+  { command: "check", description: "Check bot permissions and group setup" },
+  { command: "settings", description: "Show bot settings for a group" },
+  { command: "recent", description: "Show recently detected members and IDs" },
+  { command: "allow", description: "Allow a normal member to send messages" },
+  { command: "block", description: "Make a normal member read-only" },
+  { command: "autoblock", description: "Toggle automatic read-only for newcomers" },
+  { command: "strict", description: "Toggle enforcement for unapproved senders" },
+  { command: "deletejoins", description: "Toggle deletion of member join notices" },
+  { command: "deletecommands", description: "Toggle deletion of admin bot commands" },
+  { command: "groupadmins", description: "List group-specific bot controllers" },
+  { command: "groupadminadd", description: "Add a controller for one group only" },
+  { command: "groupadminremove", description: "Remove a group-specific controller" },
+  { command: "controlleradd", description: "Owner: add a global bot controller" },
+  { command: "controllerremove", description: "Owner: remove a global bot controller" },
+];
+
+async function installBotCommands(env) {
+  // Keep the public/default menu intentionally minimal.
+  await tg(env, "setMyCommands", {
+    commands: DEFAULT_COMMANDS,
+    scope: { type: "default" },
+  });
+
+  // Full clickable command menu appears in the owner's private chat only.
+  await tg(env, "setMyCommands", {
+    commands: OWNER_COMMANDS,
+    scope: {
+      type: "chat",
+      chat_id: Number(env.BOT_OWNER_ID),
+    },
+  });
+
+  return true;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -39,7 +85,36 @@ export default {
           allowed_updates: ALLOWED_UPDATES,
           drop_pending_updates: true,
         });
-        return json({ ok: true, webhook_url: webhookUrl, telegram: result });
+
+        let commandsInstalled = false;
+        let commandMenuWarning = null;
+        try {
+          commandsInstalled = await installBotCommands(env);
+        } catch (error) {
+          // Webhook setup should still succeed even if Telegram refuses a command scope
+          // before the owner has opened/started the bot.
+          commandMenuWarning = safeError(error);
+          console.warn("Could not install owner command menu:", error);
+        }
+
+        return json({
+          ok: true,
+          webhook_url: webhookUrl,
+          telegram: result,
+          commands_installed: commandsInstalled,
+          command_menu_warning: commandMenuWarning,
+        });
+      }
+
+      if (url.pathname === "/admin/setup-commands" && request.method === "POST") {
+        requireSetupAuth(request, env);
+        validate(env);
+        await installBotCommands(env);
+        return json({
+          ok: true,
+          owner_id: env.BOT_OWNER_ID,
+          commands_installed: true,
+        });
       }
 
       if (url.pathname === "/admin/webhook-info" && request.method === "GET") {

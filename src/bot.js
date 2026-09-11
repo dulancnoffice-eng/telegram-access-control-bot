@@ -339,31 +339,64 @@ async function notifyGlobalControllers(env, text) {
 }
 
 async function helpText(env, actor) {
+  const owner = isOwner(env, actor);
+  const global = await isGlobalController(env, actor);
+
   let text =
-    `<b>Access Control Bot</b>\n\n` +
-    `<b>Private chat</b>\n` +
-    `<code>/groups</code>\n` +
-    `<code>/check GROUP_ID</code>\n` +
-    `<code>/settings GROUP_ID</code>\n` +
-    `<code>/allow GROUP_ID USER_ID</code>\n` +
-    `<code>/block GROUP_ID USER_ID</code>\n` +
-    `<code>/recent GROUP_ID</code>\n` +
-    `<code>/autoblock GROUP_ID on|off</code>\n` +
-    `<code>/strict GROUP_ID on|off</code>\n` +
-    `<code>/deletejoins GROUP_ID on|off</code>\n` +
-    `<code>/deletecommands GROUP_ID on|off</code>\n` +
-    `<code>/groupadmins GROUP_ID</code>\n` +
-    `<code>/groupadminadd GROUP_ID USER_ID</code>\n` +
-    `<code>/groupadminremove GROUP_ID USER_ID</code>\n\n` +
-    `<b>Inside an authorized group</b>\n` +
-    `Omit GROUP_ID. You can also reply to a member with <code>/allow</code> or <code>/block</code>.\n\n` +
-    `<b>Global controllers</b>\n` +
-    `<code>/authorize GROUP_ID</code>\n` +
-    `<code>/deauthorize GROUP_ID</code>\n` +
-    `<code>/controllers</code>`;
-  if (isOwner(env, actor)) {
-    text += `\n\n<b>Owner only</b>\n<code>/controlleradd USER_ID</code>\n<code>/controllerremove USER_ID</code>`;
+    `<b>🛠 Access Control Bot Help</b>\n\n` +
+    `<b>Your access</b>\n` +
+    `${owner ? "👑 Owner" : global ? "🔑 Global controller" : "🛡 Group controller"}\n\n` +
+
+    `<b>GENERAL</b>\n` +
+    `<code>/help</code> — Show this command guide and descriptions.\n` +
+    `<code>/whoami</code> — Show your own numeric Telegram user ID.\n` +
+    `<code>/groups</code> — List the authorized groups you are allowed to manage.\n\n` +
+
+    `<b>GROUP STATUS & SETTINGS</b>\n` +
+    `<code>/check GROUP_ID</code> — Check whether the bot is admin, has Delete/Restrict permissions, the group is authorized, and global Send Messages is enabled.\n` +
+    `<code>/settings GROUP_ID</code> — Show the bot settings and member/controller counts for a group.\n` +
+    `<code>/recent GROUP_ID</code> — Show recently detected members, their Telegram IDs, and whether they are allowed to send.\n\n` +
+
+    `<b>MEMBER ACCESS</b>\n` +
+    `<code>/allow GROUP_ID USER_ID</code> — Allow a normal member to send messages without making them a Telegram admin.\n` +
+    `<code>/block GROUP_ID USER_ID</code> — Make a normal member read-only again.\n` +
+    `Inside the group, omit GROUP_ID. You can also reply to a member's message with <code>/allow</code> or <code>/block</code>.\n\n` +
+
+    `<b>AUTOMATIC MODERATION</b>\n` +
+    `<code>/autoblock GROUP_ID on|off</code> — Automatically make newly joined members read-only.\n` +
+    `<code>/strict GROUP_ID on|off</code> — Delete messages from unapproved normal members and make them read-only. This also catches older members who joined before the bot.\n` +
+    `<code>/deletejoins GROUP_ID on|off</code> — Automatically delete “joined the group / joined via invite link” service messages.\n` +
+    `<code>/deletecommands GROUP_ID on|off</code> — Delete controller commands from the public group after the bot receives them.\n\n` +
+
+    `<b>GROUP CONTROLLERS</b>\n` +
+    `<code>/groupadmins GROUP_ID</code> — List bot controllers assigned only to that group.\n` +
+    `<code>/groupadminadd GROUP_ID USER_ID</code> — Give a Telegram user permission to control only that group.\n` +
+    `<code>/groupadminremove GROUP_ID USER_ID</code> — Remove that group-specific bot controller.\n`;
+
+  if (global) {
+    text +=
+      `\n<b>GLOBAL CONTROLLER COMMANDS</b>\n` +
+      `<code>/authorize GROUP_ID</code> — Approve a group so the bot starts managing it. The bot verifies its Telegram admin permissions first.\n` +
+      `<code>/deauthorize GROUP_ID</code> — Stop bot management for that group without removing the bot.\n` +
+      `<code>/controllers</code> — List the bot owner and all global controller IDs.\n`;
   }
+
+  if (owner) {
+    text +=
+      `\n<b>👑 OWNER ONLY</b>\n` +
+      `<code>/controlleradd USER_ID</code> — Add a global controller who can manage every authorized group.\n` +
+      `<code>/controllerremove USER_ID</code> — Remove a global controller.\n`;
+  }
+
+  text +=
+    `\n<b>Private-chat format</b>\n` +
+    `Use the group ID after the command, for example:\n` +
+    `<code>/allow -1001234567890 987654321</code>\n\n` +
+    `<b>Inside an authorized group</b>\n` +
+    `The group ID is automatic, for example:\n` +
+    `<code>/allow 987654321</code>\n\n` +
+    `<i>Tip: keep Telegram Group Permissions → Send Messages ON. The bot controls individual members with per-user restrictions.</i>`;
+
   return text;
 }
 
