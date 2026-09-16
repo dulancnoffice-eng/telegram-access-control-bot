@@ -1,13 +1,19 @@
 import {
   audit,
+  cacheAllowedMember,
+  ensureGlobalAllowlistSchema,
   getAuthorizedGroup,
   getAuthorizedGroups,
-  getGroup,
+  getGlobalAllowlist,
+  getKnownMembersWithGlobalState,
+  getPendingGroups,
   isGlobalAllowedMember,
   isOwner,
   rememberGroup,
   rememberUser,
+  removeAllowedMemberCache,
   replaceGlobalAllowlist,
+  setGroupAuthorized,
 } from "./db.js";
 
 import {
@@ -22,16 +28,14 @@ import {
 
 import {
   escapeHtml,
-  nowIso,
   safeError,
-  userLabel,
 } from "./util.js";
 
-const MAX_ID_LIST = 200;
+const MAX_ID_LIST = 100;
 
-export async function handleUpdate(update, env) {
+export async function handleUpdate(update, env, ctx) {
   if (update.callback_query) {
-    return handleCallbackQuery(update.callback_query, env);
+    return handleCallbackQuery(update.callback_query, env, ctx);
   }
 
   if (update.my_chat_member) {
@@ -43,14 +47,8 @@ export async function handleUpdate(update, env) {
   }
 
   if (update.message) {
-    return handleMessage(update.message, env);
+    return handleMessage(update.message, env, ctx);
   }
-}
-
-function present(status, member) {
-  if (["member", "administrator", "creator"].includes(status)) return true;
-  if (status === "restricted") return Boolean(member?.is_member);
-  return false;
 }
 
 function ownerId(env) {
@@ -61,114 +59,403 @@ function isGroupChat(chat) {
   return chat?.type === "group" || chat?.type === "supergroup";
 }
 
-async function makeReadOnly(
-  env,
-  groupId,
-  userId,
-  actorUserId = null,
-  reason = "automatic"
-) {
-  if (String(userId) === String(env.BOT_OWNER_ID)) {
-    return { ok: false, reason: "owner" };
+function memberIsPresent(member) {
+  if (!member) return false;
+
+  if (["creator", "administrator", "member"].includes(member.status)) {
+    return true;
   }
 
-  if (await isTelegramAdmin(env, groupId, userId)) {
-    return { ok: false, reason: "telegram_admin" };
+  if (member.status === "restricted") {
+    return Boolean(member.is_member);
   }
 
-  await tg(env, "restrictChatMember", {
-    chat_id: groupId,
-    user_id: userId,
-    permissions: readonlyPermissions(),
-    use_independent_chat_permissions: true,
-  });
-
-  await env.DB.prepare(
-    `DELETE FROM allowed_members
-     WHERE group_id = ? AND user_id = ?`
-  ).bind(groupId, userId).run();
-
-  await audit(env, "member_blocked", {
-    actorUserId,
-    groupId,
-    targetUserId: userId,
-    details: { reason },
-  });
-
-  return { ok: true };
+  return false;
 }
 
-async function upsertAllowId(env, groupId, userId, actorUserId) {
-  let user = {
-    id: userId,
-    username: "",
-    first_name: "",
-    last_name: "",
-  };
+function parseIdList(text) {
+  if (!text) return null;
+
+  const trimmed = String(text).trim();
+  if (!trimmed) return null;
+
+  // Plain numeric IDs only, separated by whitespace or comma.
+  if (!/^[\d,\s]+$/.test(trimmed)) return null;
+
+  const tokens = trimmed
+    .split(/[\s,]+/)
+    .map(v => v.trim())
+    .filter(Boolean);
+
+  if (!tokens.length || tokens.length > MAX_ID_LIST) {
+    return null;
+  }
+
+  const ids = [];
+
+  for (const token of tokens) {
+    if (!/^\d{5,20}$/.test(token)) return null;
+
+    const id = Number(token);
+
+    if (!Number.isSafeInteger(id) || id <= 0) {
+      return null;
+    }
+
+    if (!ids.includes(id)) {
+      ids.push(id);
+    }
+  }
+
+  return ids.length ? ids : null;
+}
+
+async function handleMessage(message, env, ctx) {
+  const chat = message.chat;
+  const from = message.from;
+
+  // Commands are intentionally handled FIRST and do not wait for
+  // allowlist/group synchronization.
+  if (message.text?.startsWith("/")) {
+    const handled = await handleCommand(message, env);
+    if (handled) return;
+  }
+
+  // Owner sends the master allowlist privately, with no command.
+  if (
+    chat?.type === "private" &&
+    from?.id &&
+    isOwner(env, from.id) &&
+    typeof message.text === "string"
+  ) {
+    const ids = parseIdList(message.text);
+
+    if (ids) {
+      await saveOwnerGlobalAllowlist(message, ids, env, ctx);
+      return;
+    }
+  }
+
+  if (!isGroupChat(chat)) return;
+
+  await rememberGroup(env, chat);
+
+  if (from?.id) {
+    await rememberUser(env, chat.id, from);
+  }
+
+  // Telegram join service message.
+  if (
+    Array.isArray(message.new_chat_members) &&
+    message.new_chat_members.length
+  ) {
+    for (const user of message.new_chat_members) {
+      await handleJoinedUser(env, chat, user);
+    }
+
+    const group = await getAuthorizedGroup(env, chat.id);
+
+    if (group?.delete_join_messages) {
+      await deleteMessageSafe(env, chat.id, message.message_id);
+    }
+
+    return;
+  }
+
+  const group = await getAuthorizedGroup(env, chat.id);
+  if (!group) return;
+
+  if (!from?.id || from.is_bot) return;
+
+  if (String(from.id) === String(env.BOT_OWNER_ID)) {
+    return;
+  }
+
+  if (await isTelegramAdmin(env, chat.id, from.id)) {
+    return;
+  }
+
+  if (await isGlobalAllowedMember(env, from.id)) {
+    return;
+  }
+
+  // Unknown/old non-allowed member got one message through.
+  // Remove that message and make the member read-only immediately.
+  await deleteMessageSafe(env, chat.id, message.message_id);
 
   try {
-    const member = await getChatMember(env, groupId, userId);
-
-    if (member?.user) {
-      user = member.user;
-      await rememberUser(env, groupId, user);
-    }
-
-    if (!["creator", "administrator"].includes(member.status)) {
-      await tg(env, "restrictChatMember", {
-        chat_id: groupId,
-        user_id: userId,
-        permissions: allowedSendPermissions(),
-        use_independent_chat_permissions: true,
-      });
-    }
+    await restrictUser(env, chat.id, from.id, "strict_enforcement");
   } catch (error) {
-    // The ID may belong to a user who is not in the group yet.
-    // Keep it in the allowlist so it is automatically allowed if they join later.
-    console.log(
-      `Allowlist stored for future/current member ${userId}:`,
-      safeError(error)
+    console.error("Strict enforcement failed:", safeError(error));
+  }
+}
+
+async function handleCommand(message, env) {
+  const text = String(message.text || "").trim();
+  const command = text.split(/\s+/)[0].split("@")[0].toLowerCase();
+
+  if (command === "/whoami") {
+    await sendMessage(
+      env,
+      message.chat.id,
+      `<b>Your Telegram user ID</b>\n<code>${message.from.id}</code>`
     );
+    return true;
   }
 
-  await env.DB.prepare(
-    `INSERT INTO allowed_members
-      (group_id, user_id, username, first_name, last_name, allowed_by, allowed_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(group_id, user_id) DO UPDATE SET
-       username = excluded.username,
-       first_name = excluded.first_name,
-       last_name = excluded.last_name,
-       allowed_by = excluded.allowed_by,
-       allowed_at = excluded.allowed_at`
-  ).bind(
-    groupId,
-    userId,
-    user.username || "",
-    user.first_name || "",
-    user.last_name || "",
-    actorUserId,
-    nowIso()
-  ).run();
+  if (command === "/start") {
+    if (message.chat.type !== "private") {
+      return true;
+    }
 
-  await audit(env, "member_allowed", {
-    actorUserId,
-    groupId,
-    targetUserId: userId,
-  });
+    if (!isOwner(env, message.from.id)) {
+      await sendMessage(
+        env,
+        message.chat.id,
+        `This bot is privately controlled.\n\n` +
+        `Your Telegram ID: <code>${message.from.id}</code>`
+      );
+      return true;
+    }
 
-  return user;
+    // Always acknowledge /start before touching D1.
+    await sendMessage(
+      env,
+      message.chat.id,
+      `<b>Global Allowlist Bot is online ✅</b>\n\n` +
+      `Send your allowed Telegram user IDs here privately, one per line.\n\n` +
+      `<code>8475307546\n8474567703\n8475365403</code>\n\n` +
+      `That single list applies to every approved group.`
+    );
+
+    try {
+      await showPendingGroups(env, message.chat.id);
+    } catch (error) {
+      console.error("Could not show pending groups:", safeError(error));
+
+      await sendMessage(
+        env,
+        message.chat.id,
+        `⚠️ The bot is online, but I could not read the pending-group list right now.\n` +
+        `<code>${escapeHtml(safeError(error))}</code>`
+      );
+    }
+
+    return true;
+  }
+
+  if (command === "/help") {
+    if (message.chat.type !== "private") {
+      return true;
+    }
+
+    if (!isOwner(env, message.from.id)) {
+      await sendMessage(env, message.chat.id, `Access denied.`);
+      return true;
+    }
+
+    await sendMessage(
+      env,
+      message.chat.id,
+      `<b>Global Allowlist Bot</b>\n\n` +
+      `<b>Group setup</b>\n` +
+      `1. Add the bot to a Telegram <b>supergroup</b>.\n` +
+      `2. Make it administrator with <b>Delete Messages</b> and <b>Ban/Restrict Members</b>.\n` +
+      `3. Approve the group from the private Approve button.\n\n` +
+      `<b>Master posting list</b>\n` +
+      `Send IDs privately to this bot, one ID per line:\n\n` +
+      `<code>8475307546\n8474567703\n8475365403</code>\n\n` +
+      `A new list replaces the previous list.\n` +
+      `Listed normal members can send in every approved group.\n` +
+      `Non-listed normal members are read-only.\n` +
+      `Listed IDs that join later are allowed automatically.\n\n` +
+      `<b>Commands</b>\n` +
+      `<code>/start</code> — bot status + pending groups\n` +
+      `<code>/help</code> — this guide\n` +
+      `<code>/whoami</code> — show your Telegram user ID\n\n` +
+      `<i>Telegram group administrators cannot be restricted by this bot.</i>`
+    );
+
+    return true;
+  }
+
+  return false;
 }
 
-async function setDefaultGroupSendingOn(env, groupId) {
-  await tg(env, "setChatPermissions", {
-    chat_id: groupId,
-    permissions: allowedSendPermissions(),
-    use_independent_chat_permissions: true,
-  });
+async function saveOwnerGlobalAllowlist(message, ids, env, ctx) {
+  try {
+    const result = await replaceGlobalAllowlist(
+      env,
+      ids,
+      message.from.id
+    );
+
+    const groups = await getAuthorizedGroups(env);
+
+    // Reply immediately. Do NOT make the owner wait for Telegram member API calls.
+    await sendMessage(
+      env,
+      message.chat.id,
+      `<b>Global allowlist saved ✅</b>\n\n` +
+      `Allowed IDs: <b>${result.ids.length}</b>\n` +
+      `Approved groups: <b>${groups.length}</b>\n\n` +
+      `I am syncing those permissions in the background now.`
+    );
+
+    const syncTask = syncAllGroups(
+      env,
+      groups,
+      result.ids,
+      result.removedIds,
+      message.from.id
+    ).then(async summary => {
+      try {
+        await sendMessage(
+          env,
+          message.chat.id,
+          `<b>Permission sync complete ✅</b>\n\n` +
+          `Groups synced: <b>${summary.groupsSynced}</b>\n` +
+          `Listed current members enabled: <b>${summary.enabled}</b>\n` +
+          `Removed/non-listed known members restricted: <b>${summary.restricted}</b>`
+        );
+      } catch {}
+    }).catch(error => {
+      console.error("Background allowlist sync failed:", safeError(error));
+    });
+
+    if (ctx?.waitUntil) {
+      ctx.waitUntil(syncTask);
+    } else {
+      await syncTask;
+    }
+
+    await audit(env, "global_allowlist_saved", {
+      actorUserId: message.from.id,
+      details: {
+        ids: result.ids,
+        removedIds: result.removedIds,
+      },
+    });
+  } catch (error) {
+    console.error("Saving global allowlist failed:", safeError(error));
+
+    await sendMessage(
+      env,
+      message.chat.id,
+      `<b>Could not save the global allowlist</b>\n\n` +
+      `<code>${escapeHtml(safeError(error))}</code>`
+    );
+  }
 }
 
-async function processJoin(env, chat, user, reason) {
+async function syncAllGroups(env, groups, allowedIds, removedIds, actorUserId) {
+  let groupsSynced = 0;
+  let enabled = 0;
+  let restricted = 0;
+
+  for (const group of groups) {
+    try {
+      const result = await syncGroupPermissions(
+        env,
+        Number(group.chat_id),
+        allowedIds,
+        removedIds,
+        actorUserId
+      );
+
+      groupsSynced += 1;
+      enabled += result.enabled;
+      restricted += result.restricted;
+    } catch (error) {
+      console.error(
+        `Sync failed for group ${group.chat_id}:`,
+        safeError(error)
+      );
+    }
+  }
+
+  return { groupsSynced, enabled, restricted };
+}
+
+async function syncGroupPermissions(
+  env,
+  groupId,
+  allowedIds,
+  removedIds,
+  actorUserId
+) {
+  let enabled = 0;
+  let restricted = 0;
+
+  // Normal group members need the group-wide baseline to allow sending;
+  // individual restrictions then block everybody who is not approved.
+  await setDefaultGroupSendingOn(env, groupId);
+
+  // Directly check EVERY globally allowed ID against Telegram.
+  // This works even if the bot never cached that member previously.
+  for (const userId of allowedIds) {
+    try {
+      const member = await getChatMember(env, groupId, userId);
+
+      if (!memberIsPresent(member)) {
+        continue;
+      }
+
+      if (member.status === "creator" || member.status === "administrator") {
+        if (member.user) {
+          await rememberUser(env, groupId, member.user);
+        }
+        continue;
+      }
+
+      await allowUser(env, groupId, member.user || { id: userId }, actorUserId);
+      enabled += 1;
+    } catch (error) {
+      // Not in this group yet, or Telegram cannot resolve it here.
+      // Keep it in the global table. Join handling will grant access later.
+      console.log(
+        `Allowed ID ${userId} is not currently active in group ${groupId}:`,
+        safeError(error)
+      );
+    }
+  }
+
+  // IDs removed from the master list must lose posting access immediately
+  // if they are current normal members.
+  for (const userId of removedIds) {
+    try {
+      const member = await getChatMember(env, groupId, userId);
+
+      if (!memberIsPresent(member)) continue;
+      if (member.status === "creator" || member.status === "administrator") continue;
+
+      await restrictUser(env, groupId, userId, "removed_from_global_allowlist");
+      restricted += 1;
+    } catch {}
+  }
+
+  // Also restrict every known normal member not present in the global table.
+  const known = await getKnownMembersWithGlobalState(env, groupId);
+
+  for (const row of known) {
+    const userId = Number(row.user_id);
+
+    if (!userId || row.is_bot) continue;
+    if (String(userId) === String(env.BOT_OWNER_ID)) continue;
+    if (row.globally_allowed) continue;
+
+    try {
+      if (await isTelegramAdmin(env, groupId, userId)) continue;
+
+      await restrictUser(env, groupId, userId, "global_allowlist_enforcement");
+      restricted += 1;
+    } catch {}
+  }
+
+  return { enabled, restricted };
+}
+
+async function handleJoinedUser(env, chat, user) {
   if (!user?.id || user.is_bot) return;
 
   await rememberUser(env, chat.id, user);
@@ -180,18 +467,33 @@ async function processJoin(env, chat, user, reason) {
   if (await isTelegramAdmin(env, chat.id, user.id)) return;
 
   if (await isGlobalAllowedMember(env, user.id)) {
-    try {
-      await upsertAllowId(env, chat.id, user.id, ownerId(env));
-    } catch (error) {
-      console.error("Could not activate globally allowlisted joiner:", safeError(error));
-    }
+    await allowUser(env, chat.id, user, ownerId(env));
     return;
   }
 
-  try {
-    await makeReadOnly(env, chat.id, user.id, null, reason);
-  } catch (error) {
-    console.error("Could not restrict new member:", safeError(error));
+  await restrictUser(env, chat.id, user.id, "new_member_not_allowlisted");
+}
+
+async function handleChatMember(update, env) {
+  const chat = update.chat;
+  const oldMember = update.old_chat_member;
+  const newMember = update.new_chat_member;
+  const user = newMember?.user;
+
+  if (!isGroupChat(chat) || !user?.id) return;
+
+  await rememberGroup(env, chat);
+  await rememberUser(env, chat.id, user);
+
+  const wasPresent = memberIsPresent(oldMember);
+  const isPresentNow = memberIsPresent(newMember);
+
+  if (!wasPresent && isPresentNow) {
+    try {
+      await handleJoinedUser(env, chat, user);
+    } catch (error) {
+      console.error("Join permission handling failed:", safeError(error));
+    }
   }
 }
 
@@ -202,17 +504,24 @@ async function handleMyChatMember(update, env) {
 
   await rememberGroup(env, chat);
 
-  const oldPresent = present(
-    update.old_chat_member?.status,
-    update.old_chat_member
-  );
+  const oldStatus = update.old_chat_member?.status;
+  const newStatus = update.new_chat_member?.status;
 
-  const newPresent = present(
-    update.new_chat_member?.status,
-    update.new_chat_member
-  );
+  const becamePresent =
+    ["left", "kicked"].includes(oldStatus) &&
+    !["left", "kicked"].includes(newStatus);
 
-  if (!oldPresent && newPresent) {
+  const becameAdmin =
+    newStatus === "administrator" &&
+    oldStatus !== "administrator";
+
+  if (!becamePresent && !becameAdmin) {
+    return;
+  }
+
+  const existing = await getAuthorizedGroup(env, chat.id);
+
+  if (!existing) {
     await notifyOwnerForApproval(env, chat);
   }
 }
@@ -222,60 +531,48 @@ async function notifyOwnerForApproval(env, chat) {
     `<b>Bot added to a group</b>\n\n` +
     `Group: ${escapeHtml(chat.title || String(chat.id))}\n` +
     `Group ID: <code>${chat.id}</code>\n\n` +
-    `Approve this group for allowlist control?`;
-
-  const replyMarkup = {
-    inline_keyboard: [[
-      {
-        text: "✅ Approve",
-        callback_data: `approve:${chat.id}`,
-      },
-      {
-        text: "❌ Reject",
-        callback_data: `reject:${chat.id}`,
-      },
-    ]],
-  };
+    `Approve this group?`;
 
   try {
     await sendMessage(
       env,
       ownerId(env),
       text,
-      { reply_markup: replyMarkup }
+      {
+        reply_markup: {
+          inline_keyboard: [[
+            {
+              text: "✅ Approve",
+              callback_data: `approve:${chat.id}`,
+            },
+            {
+              text: "❌ Reject",
+              callback_data: `reject:${chat.id}`,
+            },
+          ]],
+        },
+      }
     );
   } catch (error) {
-    console.warn("Could not DM owner:", safeError(error));
+    console.error("Could not DM owner:", safeError(error));
 
     try {
       await sendMessage(
         env,
         chat.id,
-        `⚠️ I could not privately contact the bot owner.\n\n` +
-        `Owner: open this bot privately and press <b>Start</b>. ` +
-        `Then send <code>/start</code> to see groups waiting for approval.`
+        `⚠️ Open the bot privately from the owner account and press Start.`
       );
     } catch {}
   }
-
-  await audit(env, "group_pending_approval", {
-    groupId: chat.id,
-  });
 }
 
-async function showPendingGroups(env, chatId) {
-  const rows = await env.DB.prepare(
-    `SELECT chat_id, title
-     FROM groups
-     WHERE authorized = 0
-     ORDER BY updated_at DESC
-     LIMIT 20`
-  ).all();
+async function showPendingGroups(env, ownerChatId) {
+  const rows = await getPendingGroups(env);
 
-  if (!(rows.results || []).length) {
+  if (!rows.length) {
     await sendMessage(
       env,
-      chatId,
+      ownerChatId,
       `✅ No groups are waiting for approval.`
     );
     return;
@@ -283,27 +580,26 @@ async function showPendingGroups(env, chatId) {
 
   await sendMessage(
     env,
-    chatId,
-    `<b>Groups waiting for approval</b>\n\n` +
-    `Tap Approve for the group you want the bot to manage.`
+    ownerChatId,
+    `<b>Groups waiting for approval</b>`
   );
 
-  for (const row of rows.results || []) {
+  for (const group of rows) {
     await sendMessage(
       env,
-      chatId,
-      `${escapeHtml(row.title || String(row.chat_id))}\n` +
-      `<code>${row.chat_id}</code>`,
+      ownerChatId,
+      `${escapeHtml(group.title || String(group.chat_id))}\n` +
+      `<code>${group.chat_id}</code>`,
       {
         reply_markup: {
           inline_keyboard: [[
             {
               text: "✅ Approve",
-              callback_data: `approve:${row.chat_id}`,
+              callback_data: `approve:${group.chat_id}`,
             },
             {
               text: "❌ Reject",
-              callback_data: `reject:${row.chat_id}`,
+              callback_data: `reject:${group.chat_id}`,
             },
           ]],
         },
@@ -312,67 +608,51 @@ async function showPendingGroups(env, chatId) {
   }
 }
 
-async function handleCallbackQuery(query, env) {
-  const fromId = query.from?.id;
+async function handleCallbackQuery(query, env, ctx) {
+  const actorId = query.from?.id;
 
-  if (!fromId || !isOwner(env, fromId)) {
-    try {
-      await tg(env, "answerCallbackQuery", {
-        callback_query_id: query.id,
-        text: "Only the bot owner can approve groups.",
-        show_alert: true,
-      });
-    } catch {}
+  // Stop Telegram's spinner immediately, before any D1 or group API work.
+  try {
+    await tg(env, "answerCallbackQuery", {
+      callback_query_id: query.id,
+      text: isOwner(env, actorId) ? "Processing…" : "Owner only.",
+      show_alert: !isOwner(env, actorId),
+    });
+  } catch {}
+
+  if (!actorId || !isOwner(env, actorId)) {
     return;
   }
 
   const match = String(query.data || "").match(/^(approve|reject):(-?\d+)$/);
 
-  if (!match) {
-    try {
-      await tg(env, "answerCallbackQuery", {
-        callback_query_id: query.id,
-        text: "Unknown action.",
-      });
-    } catch {}
-    return;
-  }
+  if (!match) return;
 
   const action = match[1];
   const groupId = Number(match[2]);
 
   if (action === "reject") {
-    await env.DB.prepare(
-      `UPDATE groups
-       SET authorized = 0, updated_at = ?
-       WHERE chat_id = ?`
-    ).bind(nowIso(), groupId).run();
-
-    await audit(env, "group_rejected", {
-      actorUserId: fromId,
-      groupId,
-    });
-
-    await tg(env, "answerCallbackQuery", {
-      callback_query_id: query.id,
-      text: "Group rejected.",
-    });
+    await setGroupAuthorized(env, groupId, false, actorId);
 
     if (query.message) {
-      await tg(env, "editMessageText", {
-        chat_id: query.message.chat.id,
-        message_id: query.message.message_id,
-        text:
-          `<b>Group rejected ❌</b>\n\n` +
-          `Group ID: <code>${groupId}</code>`,
-        parse_mode: "HTML",
-      });
+      try {
+        await tg(env, "editMessageText", {
+          chat_id: query.message.chat.id,
+          message_id: query.message.message_id,
+          text:
+            `<b>Group rejected ❌</b>\n\n` +
+            `Group ID: <code>${groupId}</code>`,
+          parse_mode: "HTML",
+        });
+      } catch {}
     }
 
     return;
   }
 
   try {
+    await ensureGlobalAllowlistSchema(env);
+
     const chat = await tg(env, "getChat", { chat_id: groupId });
     const me = await tg(env, "getMe");
     const botMember = await getChatMember(env, groupId, me.id);
@@ -389,31 +669,25 @@ async function handleCallbackQuery(query, env) {
       botMember.status === "creator" ||
       Boolean(botMember.can_restrict_members);
 
-    if (chat.type !== "supergroup" || !isAdmin || !canDelete || !canRestrict) {
-      const missing = [];
+    const missing = [];
 
-      if (chat.type !== "supergroup") {
-        missing.push("Group must be a supergroup");
-      }
+    if (chat.type !== "supergroup") {
+      missing.push("Group must be a supergroup");
+    }
 
-      if (!isAdmin) {
-        missing.push("Bot must be an administrator");
-      }
+    if (!isAdmin) {
+      missing.push("Bot must be an administrator");
+    }
 
-      if (!canDelete) {
-        missing.push("Delete Messages permission");
-      }
+    if (!canDelete) {
+      missing.push("Delete Messages permission");
+    }
 
-      if (!canRestrict) {
-        missing.push("Ban/Restrict Members permission");
-      }
+    if (!canRestrict) {
+      missing.push("Ban/Restrict Members permission");
+    }
 
-      await tg(env, "answerCallbackQuery", {
-        callback_query_id: query.id,
-        text: "Bot permissions are incomplete.",
-        show_alert: true,
-      });
-
+    if (missing.length) {
       await sendMessage(
         env,
         ownerId(env),
@@ -425,564 +699,122 @@ async function handleCallbackQuery(query, env) {
       return;
     }
 
-    await rememberGroup(env, chat);
-
-    // Remove the old global "admins only can send" problem automatically.
+    // Fix the old "admins only can send" global permission.
     await setDefaultGroupSendingOn(env, groupId);
 
-    await env.DB.prepare(
-      `UPDATE groups
-       SET authorized = 1,
-           auto_restrict_new_members = 1,
-           strict_enforcement = 1,
-           delete_join_messages = 1,
-           delete_controller_commands = 1,
-           authorized_by = ?,
-           authorized_at = ?,
-           updated_at = ?
-       WHERE chat_id = ?`
-    ).bind(
-      fromId,
-      nowIso(),
-      nowIso(),
-      groupId
-    ).run();
-
-    await syncGlobalAllowlistToGroup(env, groupId);
-
-    await audit(env, "group_approved", {
-      actorUserId: fromId,
-      groupId,
-    });
-
-    await tg(env, "answerCallbackQuery", {
-      callback_query_id: query.id,
-      text: "Group approved.",
-    });
+    await rememberGroup(env, chat);
+    await setGroupAuthorized(env, groupId, true, actorId);
 
     if (query.message) {
-      await tg(env, "editMessageText", {
-        chat_id: query.message.chat.id,
-        message_id: query.message.message_id,
-        text:
-          `<b>Group approved ✅</b>\n\n` +
-          `${escapeHtml(chat.title || String(groupId))}\n` +
-          `<code>${groupId}</code>\n\n` +
-          `This group now uses your <b>global private allowlist</b>.\n\n` +
-          `Send member IDs privately to this bot, one ID per line:\n\n` +
-          `<code>8475307546\n8474567703\n8475365403</code>\n\n` +
-          `Those IDs will be allowed in every approved group.`,
-        parse_mode: "HTML",
-      });
-    }
-
-    try {
-      await sendMessage(
-        env,
-        groupId,
-        `✅ <b>Bot activated</b>\n\n` +
-        `This group uses the owner's global private allowlist.\n` +
-        `Non-listed normal members remain read-only.`
-      );
-    } catch {}
-  } catch (error) {
-    console.error("Approval failed:", error);
-
-    try {
-      await tg(env, "answerCallbackQuery", {
-        callback_query_id: query.id,
-        text: "Approval failed. Check bot admin permissions.",
-        show_alert: true,
-      });
-    } catch {}
-
-    try {
-      await sendMessage(
-        env,
-        ownerId(env),
-        `<b>Approval failed</b>\n\n${escapeHtml(safeError(error))}`
-      );
-    } catch {}
-  }
-}
-
-function parseIdList(text) {
-  if (!text) return null;
-
-  const trimmed = text.trim();
-
-  if (!trimmed) return null;
-
-  // Owner control messages are intentionally strict:
-  // digits + commas + spaces/newlines only.
-  if (!/^[\d,\s]+$/.test(trimmed)) return null;
-
-  const tokens = trimmed
-    .split(/[\s,]+/)
-    .map(x => x.trim())
-    .filter(Boolean);
-
-  if (!tokens.length || tokens.length > MAX_ID_LIST) return null;
-
-  const ids = [];
-
-  for (const token of tokens) {
-    if (!/^\d{5,20}$/.test(token)) return null;
-
-    const value = Number(token);
-
-    if (!Number.isSafeInteger(value) || value <= 0) return null;
-
-    if (!ids.includes(value)) {
-      ids.push(value);
-    }
-  }
-
-  return ids.length ? ids : null;
-}
-
-async function replaceGlobalAllowlistFromPrivateMessage(env, message, ids) {
-  const actorId = message.from.id;
-
-  await replaceGlobalAllowlist(env, ids, actorId);
-
-  // The per-group table is now only a cache of permissions actually applied.
-  // Clear old entries so removed IDs do not remain trusted.
-  await env.DB.prepare(`DELETE FROM allowed_members`).run();
-
-  const groups = await getAuthorizedGroups(env);
-
-  let activated = 0;
-  let restricted = 0;
-  let groupsSynced = 0;
-
-  for (const group of groups) {
-    try {
-      const result = await syncGlobalAllowlistToGroup(env, group.chat_id);
-      activated += result.activated;
-      restricted += result.restricted;
-      groupsSynced += 1;
-    } catch (error) {
-      console.error(
-        `Could not sync global allowlist to group ${group.chat_id}:`,
-        safeError(error)
-      );
-    }
-  }
-
-  await audit(env, "global_allowlist_replaced", {
-    actorUserId: actorId,
-    details: {
-      ids,
-      groupsSynced,
-      activated,
-      restricted,
-    },
-  });
-
-  const preview = ids
-    .slice(0, 20)
-    .map(id => `<code>${id}</code>`)
-    .join("\\n");
-
-  const more = ids.length > 20
-    ? `\\n…and ${ids.length - 20} more`
-    : "";
-
-  await sendMessage(
-    env,
-    actorId,
-    `<b>Global allowlist updated ✅</b>\\n\\n` +
-    `Allowed IDs: <b>${ids.length}</b>\\n` +
-    `Approved groups synced: <b>${groupsSynced}</b>\\n` +
-    `Known current members enabled: <b>${activated}</b>\\n` +
-    `Known non-listed members restricted: <b>${restricted}</b>\\n\\n` +
-    `${preview}${more}\\n\\n` +
-    `These IDs are now allowed to send in <b>every approved group</b>.\\n` +
-    `If one of these IDs joins an approved group later, the bot will allow it automatically.\\n\\n` +
-    `Send a new private ID list anytime to replace this master list.`
-  );
-}
-
-async function syncGlobalAllowlistToGroup(env, groupId) {
-  // Telegram's group-wide Send Messages permission must be ON.
-  // Individual restrictions are what make non-allowlisted members read-only.
-  try {
-    await setDefaultGroupSendingOn(env, groupId);
-  } catch (error) {
-    console.warn(
-      `Could not set default group permissions for ${groupId}:`,
-      safeError(error)
-    );
-  }
-
-  let activated = 0;
-  let restricted = 0;
-  let notInGroup = 0;
-
-  // IMPORTANT:
-  // Do NOT depend on known_members for allowed IDs. The owner may send an ID
-  // for a user who was already in the group before the bot saw them.
-  // Query every global ID directly through Telegram.
-  const globalRows = await env.DB.prepare(
-    `SELECT user_id
-     FROM global_allowed_members
-     ORDER BY user_id`
-  ).all();
-
-  for (const row of globalRows.results || []) {
-    const userId = Number(row.user_id);
-
-    if (!userId) continue;
-    if (String(userId) === String(env.BOT_OWNER_ID)) continue;
-
-    try {
-      const member = await getChatMember(env, groupId, userId);
-
-      // "left" / "kicked" means the account is not currently in this group.
-      if (member.status === "left" || member.status === "kicked") {
-        notInGroup += 1;
-        continue;
-      }
-
-      // Telegram administrators already have posting rights and cannot be
-      // restricted/unrestricted by this moderation flow.
-      if (member.status === "creator" || member.status === "administrator") {
-        if (member.user) {
-          await rememberUser(env, groupId, member.user);
-        }
-        continue;
-      }
-
-      // member / restricted -> remove sending restriction now.
-      await upsertAllowId(env, groupId, userId, ownerId(env));
-      activated += 1;
-    } catch (error) {
-      // If Telegram cannot resolve the ID in this group, keep the ID in the
-      // global allowlist. processJoin() will grant access automatically if
-      // that account joins later.
-      notInGroup += 1;
-      console.log(
-        `Global allowed ID ${userId} is not currently resolvable in group ${groupId}:`,
-        safeError(error)
-      );
-    }
-  }
-
-  // Now restrict every KNOWN normal member who is not in the global list.
-  // Unknown old members are still caught by strict enforcement on their first
-  // attempted message.
-  const knownRows = await env.DB.prepare(
-    `SELECT
-       km.user_id,
-       km.is_bot,
-       CASE WHEN gam.user_id IS NULL THEN 0 ELSE 1 END AS globally_allowed
-     FROM known_members km
-     LEFT JOIN global_allowed_members gam
-       ON gam.user_id = km.user_id
-     WHERE km.group_id = ?
-     ORDER BY km.last_seen_at DESC`
-  ).bind(groupId).all();
-
-  for (const row of knownRows.results || []) {
-    const userId = Number(row.user_id);
-
-    if (!userId || row.is_bot) continue;
-    if (String(userId) === String(env.BOT_OWNER_ID)) continue;
-    if (row.globally_allowed) continue;
-
-    try {
-      if (await isTelegramAdmin(env, groupId, userId)) continue;
-
-      const result = await makeReadOnly(
-        env,
-        groupId,
-        userId,
-        ownerId(env),
-        "global_allowlist_enforcement"
-      );
-
-      if (result.ok) restricted += 1;
-    } catch (error) {
-      console.warn(
-        `Could not restrict non-global member ${userId} in ${groupId}:`,
-        safeError(error)
-      );
-    }
-  }
-
-  return { activated, restricted, notInGroup };
-}
-
-async function restrictKnownNonAllowed(
-  env,
-  groupId,
-  allowSet = null
-) {
-  const rows = await env.DB.prepare(
-    `SELECT user_id, is_bot
-     FROM known_members
-     WHERE group_id = ?
-     ORDER BY last_seen_at DESC
-     LIMIT 100`
-  ).bind(groupId).all();
-
-  let restricted = 0;
-
-  for (const row of rows.results || []) {
-    const userId = Number(row.user_id);
-
-    if (!userId || row.is_bot) continue;
-    if (String(userId) === String(env.BOT_OWNER_ID)) continue;
-
-    const isAllowed = allowSet
-      ? allowSet.has(String(userId))
-      : await isGlobalAllowedMember(env, userId);
-
-    if (isAllowed) continue;
-
-    try {
-      if (await isTelegramAdmin(env, groupId, userId)) continue;
-
-      const result = await makeReadOnly(
-        env,
-        groupId,
-        userId,
-        ownerId(env),
-        "allowlist_enforcement"
-      );
-
-      if (result.ok) restricted += 1;
-    } catch (error) {
-      console.warn(
-        `Could not restrict known member ${userId}:`,
-        safeError(error)
-      );
-    }
-  }
-
-  return restricted;
-}
-
-async function handleChatMember(update, env) {
-  const chat = update.chat;
-  const user = update.new_chat_member?.user;
-
-  if (!isGroupChat(chat) || !user?.id) return;
-
-  await rememberGroup(env, chat);
-  await rememberUser(env, chat.id, user);
-
-  const oldPresent = present(
-    update.old_chat_member?.status,
-    update.old_chat_member
-  );
-
-  const newPresent = present(
-    update.new_chat_member?.status,
-    update.new_chat_member
-  );
-
-  if (!oldPresent && newPresent) {
-    await processJoin(env, chat, user, "chat_member_join");
-  }
-}
-
-async function handleMessage(message, env) {
-  const chat = message.chat;
-  const from = message.from;
-
-  if (message.text?.startsWith("/")) {
-    const handled = await handleSimpleCommand(message, env);
-    if (handled) return;
-  }
-
-  // Owner maintains ONE master allowlist by sending plain IDs privately.
-  // No command is required.
-  if (
-    chat?.type === "private" &&
-    from?.id &&
-    isOwner(env, from.id) &&
-    typeof message.text === "string"
-  ) {
-    const ids = parseIdList(message.text);
-
-    if (ids) {
-      await replaceGlobalAllowlistFromPrivateMessage(env, message, ids);
-      return;
-    }
-  }
-
-  if (!isGroupChat(chat)) return;
-
-  await rememberGroup(env, chat);
-
-  if (from?.id) {
-    await rememberUser(env, chat.id, from);
-  }
-
-  if (
-    Array.isArray(message.new_chat_members) &&
-    message.new_chat_members.length
-  ) {
-    for (const user of message.new_chat_members) {
-      await processJoin(
-        env,
-        chat,
-        user,
-        "new_chat_members"
-      );
-    }
-
-    const group = await getAuthorizedGroup(env, chat.id);
-
-    if (group?.delete_join_messages) {
-      await deleteMessageSafe(
-        env,
-        chat.id,
-        message.message_id
-      );
-    }
-
-    return;
-  }
-
-  const group = await getAuthorizedGroup(env, chat.id);
-
-  if (!group) return;
-
-  if (!from?.id || from.is_bot) return;
-
-  if (String(from.id) === String(env.BOT_OWNER_ID)) return;
-
-  if (await isTelegramAdmin(env, chat.id, from.id)) {
-    return;
-  }
-
-  if (await isGlobalAllowedMember(env, from.id)) {
-    // Normally the user was already unrestricted on join/list sync. If they
-    // are globally allowed, never delete their message.
-    return;
-  }
-
-  // Everyone else is enforced as read-only.
-  await deleteMessageSafe(
-    env,
-    chat.id,
-    message.message_id
-  );
-
-  try {
-    await makeReadOnly(
-      env,
-      chat.id,
-      from.id,
-      null,
-      "unapproved_sender"
-    );
-  } catch (error) {
-    console.error(
-      "Strict allowlist enforcement failed:",
-      safeError(error)
-    );
-  }
-}
-
-async function handleSimpleCommand(message, env) {
-  const text = String(message.text || "").trim();
-  const command = text.split(/\s+/)[0].split("@")[0].toLowerCase();
-
-  if (command === "/whoami") {
-    await sendMessage(
-      env,
-      message.chat.id,
-      `<b>Your Telegram user ID</b>\n<code>${message.from.id}</code>`
-    );
-    return true;
-  }
-
-  if (command === "/start") {
-    if (!isOwner(env, message.from.id)) {
-      await sendMessage(
-        env,
-        message.chat.id,
-        `This bot is privately controlled.\n\n` +
-        `Your Telegram ID: <code>${message.from.id}</code>`
-      );
-      return true;
-    }
-
-    if (message.chat.type !== "private") {
-      return true;
-    }
-
-    await sendMessage(
-      env,
-      message.chat.id,
-      `<b>Global Allowlist Bot</b>\n\n` +
-      `When this bot is added to a group, you will receive an approval button here.\n\n` +
-      `To manage sending access, send the allowed Telegram user IDs <b>here privately</b>, one ID per line.\n\n` +
-      `<code>8475307546\n8474567703\n8475365403</code>\n\n` +
-      `That one master list applies to every approved group.`
-    );
-
-    await showPendingGroups(
-      env,
-      message.chat.id
-    );
-
-    return true;
-  }
-
-  if (command === "/help") {
-    if (!isOwner(env, message.from.id)) {
-      if (message.chat.type === "private") {
-        await sendMessage(
-          env,
-          message.chat.id,
-          `Access denied.`
-        );
-      }
-      return true;
-    }
-
-    const help =
-      `<b>Global Allowlist Bot</b>\n\n` +
-      `<b>1. Add bot to a group</b>\n` +
-      `Give it <b>Delete Messages</b> and <b>Ban/Restrict Members</b> admin permissions.\n\n` +
-      `<b>2. Approve privately</b>\n` +
-      `The bot sends the owner an Approve / Reject button here.\n\n` +
-      `<b>3. Send the master ID list PRIVATELY to this bot</b>\n\n` +
-      `<code>8475307546\n8474567703\n8475365403</code>\n\n` +
-      `No command is needed. A new private list completely replaces the previous global allowlist.\n\n` +
-      `<b>4. Global enforcement</b>\n` +
-      `Listed IDs can send in every approved group.\n` +
-      `If a listed ID joins another approved group later, it is allowed automatically.\n` +
-      `All other normal members are read-only.\n` +
-      `Join notices are deleted automatically.\n\n` +
-      `<b>Important</b>\n` +
-      `Telegram group administrators cannot be restricted by a bot. Anyone who should follow this allowlist must remain a normal member.\n\n` +
-      `<code>/start</code> — show pending groups\n` +
-      `<code>/help</code> — show this guide\n` +
-      `<code>/whoami</code> — show your Telegram ID`;
-    if (message.chat.type === "private") {
-      await sendMessage(
-        env,
-        message.chat.id,
-        help
-      );
-    } else {
       try {
-        await sendMessage(
-          env,
-          message.from.id,
-          help
-        );
+        await tg(env, "editMessageText", {
+          chat_id: query.message.chat.id,
+          message_id: query.message.message_id,
+          text:
+            `<b>Group approved ✅</b>\n\n` +
+            `${escapeHtml(chat.title || String(groupId))}\n` +
+            `<code>${groupId}</code>\n\n` +
+            `This group now uses your private global allowlist.`,
+          parse_mode: "HTML",
+        });
       } catch {}
     }
 
-    return true;
+    try {
+      await sendMessage(
+        env,
+        groupId,
+        `✅ <b>Access Control Bot activated</b>\n` +
+        `Only globally allowlisted normal members can post.`
+      );
+    } catch {}
+
+    const allowedRows = await getGlobalAllowlist(env);
+    const allowedIds = allowedRows.map(row => Number(row.user_id));
+
+    const task = syncGroupPermissions(
+      env,
+      groupId,
+      allowedIds,
+      [],
+      actorId
+    ).catch(error => {
+      console.error("Initial group sync failed:", safeError(error));
+    });
+
+    if (ctx?.waitUntil) {
+      ctx.waitUntil(task);
+    } else {
+      await task;
+    }
+
+    await audit(env, "group_approved", {
+      actorUserId: actorId,
+      groupId,
+    });
+  } catch (error) {
+    console.error("Approval failed:", safeError(error));
+
+    try {
+      await sendMessage(
+        env,
+        ownerId(env),
+        `<b>Approval failed</b>\n\n` +
+        `<code>${escapeHtml(safeError(error))}</code>`
+      );
+    } catch {}
+  }
+}
+
+async function setDefaultGroupSendingOn(env, groupId) {
+  await tg(env, "setChatPermissions", {
+    chat_id: groupId,
+    permissions: allowedSendPermissions(),
+    use_independent_chat_permissions: true,
+  });
+}
+
+async function allowUser(env, groupId, user, actorUserId) {
+  const userId = Number(user?.id);
+
+  if (!userId) return false;
+
+  await tg(env, "restrictChatMember", {
+    chat_id: groupId,
+    user_id: userId,
+    permissions: allowedSendPermissions(),
+    use_independent_chat_permissions: true,
+  });
+
+  await rememberUser(env, groupId, user);
+  await cacheAllowedMember(env, groupId, user, actorUserId);
+
+  return true;
+}
+
+async function restrictUser(env, groupId, userId, reason) {
+  if (String(userId) === String(env.BOT_OWNER_ID)) {
+    return false;
   }
 
-  return false;
+  if (await isTelegramAdmin(env, groupId, userId)) {
+    return false;
+  }
+
+  await tg(env, "restrictChatMember", {
+    chat_id: groupId,
+    user_id: userId,
+    permissions: readonlyPermissions(),
+    use_independent_chat_permissions: true,
+  });
+
+  await removeAllowedMemberCache(env, groupId, userId);
+
+  await audit(env, "member_restricted", {
+    groupId,
+    targetUserId: userId,
+    details: { reason },
+  });
+
+  return true;
 }
