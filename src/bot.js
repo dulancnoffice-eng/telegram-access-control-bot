@@ -605,8 +605,8 @@ async function replaceGlobalAllowlistFromPrivateMessage(env, message, ids) {
 }
 
 async function syncGlobalAllowlistToGroup(env, groupId) {
-  // Keep Telegram's default sending enabled. Individual restrictions are what
-  // make non-allowlisted normal members read-only.
+  // Telegram's group-wide Send Messages permission must be ON.
+  // Individual restrictions are what make non-allowlisted members read-only.
   try {
     await setDefaultGroupSendingOn(env, groupId);
   } catch (error) {
@@ -616,7 +616,63 @@ async function syncGlobalAllowlistToGroup(env, groupId) {
     );
   }
 
-  const rows = await env.DB.prepare(
+  let activated = 0;
+  let restricted = 0;
+  let notInGroup = 0;
+
+  // IMPORTANT:
+  // Do NOT depend on known_members for allowed IDs. The owner may send an ID
+  // for a user who was already in the group before the bot saw them.
+  // Query every global ID directly through Telegram.
+  const globalRows = await env.DB.prepare(
+    `SELECT user_id
+     FROM global_allowed_members
+     ORDER BY user_id`
+  ).all();
+
+  for (const row of globalRows.results || []) {
+    const userId = Number(row.user_id);
+
+    if (!userId) continue;
+    if (String(userId) === String(env.BOT_OWNER_ID)) continue;
+
+    try {
+      const member = await getChatMember(env, groupId, userId);
+
+      // "left" / "kicked" means the account is not currently in this group.
+      if (member.status === "left" || member.status === "kicked") {
+        notInGroup += 1;
+        continue;
+      }
+
+      // Telegram administrators already have posting rights and cannot be
+      // restricted/unrestricted by this moderation flow.
+      if (member.status === "creator" || member.status === "administrator") {
+        if (member.user) {
+          await rememberUser(env, groupId, member.user);
+        }
+        continue;
+      }
+
+      // member / restricted -> remove sending restriction now.
+      await upsertAllowId(env, groupId, userId, ownerId(env));
+      activated += 1;
+    } catch (error) {
+      // If Telegram cannot resolve the ID in this group, keep the ID in the
+      // global allowlist. processJoin() will grant access automatically if
+      // that account joins later.
+      notInGroup += 1;
+      console.log(
+        `Global allowed ID ${userId} is not currently resolvable in group ${groupId}:`,
+        safeError(error)
+      );
+    }
+  }
+
+  // Now restrict every KNOWN normal member who is not in the global list.
+  // Unknown old members are still caught by strict enforcement on their first
+  // attempted message.
+  const knownRows = await env.DB.prepare(
     `SELECT
        km.user_id,
        km.is_bot,
@@ -628,47 +684,34 @@ async function syncGlobalAllowlistToGroup(env, groupId) {
      ORDER BY km.last_seen_at DESC`
   ).bind(groupId).all();
 
-  let activated = 0;
-  let restricted = 0;
-
-  for (const row of rows.results || []) {
+  for (const row of knownRows.results || []) {
     const userId = Number(row.user_id);
 
     if (!userId || row.is_bot) continue;
     if (String(userId) === String(env.BOT_OWNER_ID)) continue;
-    if (await isTelegramAdmin(env, groupId, userId)) continue;
+    if (row.globally_allowed) continue;
 
-    if (row.globally_allowed) {
-      try {
-        await upsertAllowId(env, groupId, userId, ownerId(env));
-        activated += 1;
-      } catch (error) {
-        console.warn(
-          `Could not enable globally allowed member ${userId} in ${groupId}:`,
-          safeError(error)
-        );
-      }
-    } else {
-      try {
-        const result = await makeReadOnly(
-          env,
-          groupId,
-          userId,
-          ownerId(env),
-          "global_allowlist_enforcement"
-        );
+    try {
+      if (await isTelegramAdmin(env, groupId, userId)) continue;
 
-        if (result.ok) restricted += 1;
-      } catch (error) {
-        console.warn(
-          `Could not restrict non-global member ${userId} in ${groupId}:`,
-          safeError(error)
-        );
-      }
+      const result = await makeReadOnly(
+        env,
+        groupId,
+        userId,
+        ownerId(env),
+        "global_allowlist_enforcement"
+      );
+
+      if (result.ok) restricted += 1;
+    } catch (error) {
+      console.warn(
+        `Could not restrict non-global member ${userId} in ${groupId}:`,
+        safeError(error)
+      );
     }
   }
 
-  return { activated, restricted };
+  return { activated, restricted, notInGroup };
 }
 
 async function restrictKnownNonAllowed(
