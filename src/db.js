@@ -102,3 +102,58 @@ export async function isAllowedMember(env, groupId, userId) {
     `SELECT 1 FROM allowed_members WHERE group_id = ? AND user_id = ?`
   ).bind(groupId, userId).first());
 }
+
+export async function isGlobalAllowedMember(env, userId) {
+  return Boolean(await env.DB.prepare(
+    `SELECT 1 FROM global_allowed_members WHERE user_id = ?`
+  ).bind(userId).first());
+}
+
+export async function getGlobalAllowlist(env) {
+  const rows = await env.DB.prepare(
+    `SELECT user_id, added_by, added_at
+     FROM global_allowed_members
+     ORDER BY user_id`
+  ).all();
+
+  return rows.results || [];
+}
+
+export async function replaceGlobalAllowlist(env, userIds, actorUserId) {
+  const uniqueIds = [...new Set(
+    (userIds || [])
+      .map(Number)
+      .filter(id => Number.isSafeInteger(id) && id > 0)
+  )];
+
+  const statements = [
+    env.DB.prepare(`DELETE FROM global_allowed_members`)
+  ];
+
+  const addedAt = nowIso();
+
+  for (const userId of uniqueIds) {
+    statements.push(
+      env.DB.prepare(
+        `INSERT INTO global_allowed_members
+         (user_id, added_by, added_at)
+         VALUES (?, ?, ?)`
+      ).bind(userId, actorUserId, addedAt)
+    );
+  }
+
+  await env.DB.batch(statements);
+  return uniqueIds;
+}
+
+export async function getAuthorizedGroups(env) {
+  const rows = await env.DB.prepare(
+    `SELECT chat_id, title
+     FROM groups
+     WHERE authorized = 1
+     ORDER BY title`
+  ).all();
+
+  return rows.results || [];
+}
+
