@@ -198,22 +198,6 @@ async function processJoin(env, chat, user, reason) {
 async function handleMyChatMember(update, env) {
   const chat = update.chat;
 
-  // Owner maintains ONE master allowlist by sending plain IDs privately.
-  // No command is required.
-  if (
-    chat?.type === "private" &&
-    from?.id &&
-    isOwner(env, from.id) &&
-    typeof message.text === "string"
-  ) {
-    const ids = parseIdList(message.text);
-
-    if (ids) {
-      await replaceGlobalAllowlistFromPrivateMessage(env, message, ids);
-      return;
-    }
-  }
-
   if (!isGroupChat(chat)) return;
 
   await rememberGroup(env, chat);
