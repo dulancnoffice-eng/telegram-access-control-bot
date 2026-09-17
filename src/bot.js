@@ -632,7 +632,24 @@ async function handleCallbackQuery(query, env, ctx) {
   const groupId = Number(match[2]);
 
   if (action === "reject") {
-    await setGroupAuthorized(env, groupId, false, actorId);
+    // Store a permanent rejected state:
+    //   1  = approved
+    //   0  = waiting for owner approval
+    //  -1  = rejected by owner
+    //
+    // getPendingGroups() only selects authorized = 0, so rejected groups
+    // will no longer reappear every time the owner sends /start.
+    await env.DB.prepare(
+      `UPDATE groups
+       SET authorized = -1,
+           updated_at = datetime('now')
+       WHERE chat_id = ?`
+    ).bind(groupId).run();
+
+    await audit(env, "group_rejected", {
+      actorUserId: actorId,
+      groupId,
+    });
 
     if (query.message) {
       try {
@@ -641,7 +658,8 @@ async function handleCallbackQuery(query, env, ctx) {
           message_id: query.message.message_id,
           text:
             `<b>Group rejected ❌</b>\n\n` +
-            `Group ID: <code>${groupId}</code>`,
+            `Group ID: <code>${groupId}</code>\n\n` +
+            `<i>This group will not appear in the pending list again.</i>`,
           parse_mode: "HTML",
         });
       } catch {}
