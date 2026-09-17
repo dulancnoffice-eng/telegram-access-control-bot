@@ -316,7 +316,14 @@ async function saveOwnerGlobalAllowlist(message, ids, env, ctx) {
           `<b>Permission sync complete ✅</b>\n\n` +
           `Groups synced: <b>${summary.groupsSynced}</b>\n` +
           `Listed current members enabled: <b>${summary.enabled}</b>\n` +
-          `Removed/non-listed known members restricted: <b>${summary.restricted}</b>`
+          `Removed/non-listed known members restricted: <b>${summary.restricted}</b>` +
+          (summary.failedGroups?.length
+            ? `\n\n<b>Groups with sync warnings:</b>\n` +
+              summary.failedGroups
+                .slice(0, 10)
+                .map(x => `• ${escapeHtml(x)}`)
+                .join("\n")
+            : "")
         );
       } catch {}
     }).catch(error => {
@@ -349,32 +356,56 @@ async function saveOwnerGlobalAllowlist(message, ids, env, ctx) {
 }
 
 async function syncAllGroups(env, groups, allowedIds, removedIds, actorUserId) {
-  let groupsSynced = 0;
-  let enabled = 0;
-  let restricted = 0;
-
-  for (const group of groups) {
-    try {
-      const result = await syncGroupPermissions(
+  // Synchronize approved groups in parallel. The previous sequential loop could
+  // exceed Cloudflare's background execution window when many groups existed.
+  const results = await Promise.allSettled(
+    groups.map(group =>
+      syncGroupPermissions(
         env,
         Number(group.chat_id),
         allowedIds,
         removedIds,
         actorUserId
-      );
+      ).then(result => ({
+        groupId: Number(group.chat_id),
+        title: group.title || String(group.chat_id),
+        ...result,
+      }))
+    )
+  );
 
+  let groupsSynced = 0;
+  let enabled = 0;
+  let restricted = 0;
+  const failedGroups = [];
+
+  for (let i = 0; i < results.length; i += 1) {
+    const result = results[i];
+    const group = groups[i];
+
+    if (result.status === "fulfilled") {
       groupsSynced += 1;
-      enabled += result.enabled;
-      restricted += result.restricted;
-    } catch (error) {
-      console.error(
-        `Sync failed for group ${group.chat_id}:`,
-        safeError(error)
+      enabled += result.value.enabled || 0;
+      restricted += result.value.restricted || 0;
+
+      if (result.value.errors?.length) {
+        failedGroups.push(
+          `${group.title || group.chat_id}: ${result.value.errors.join("; ")}`
+        );
+      }
+    } else {
+      failedGroups.push(
+        `${group.title || group.chat_id}: ${safeError(result.reason)}`
       );
     }
   }
 
-  return { groupsSynced, enabled, restricted };
+  return {
+    groupsSynced,
+    enabled,
+    restricted,
+    failedGroups,
+  };
 }
 
 async function syncGroupPermissions(
@@ -386,55 +417,115 @@ async function syncGroupPermissions(
 ) {
   let enabled = 0;
   let restricted = 0;
+  const errors = [];
 
-  // Normal group members need the group-wide baseline to allow sending;
-  // individual restrictions then block everybody who is not approved.
-  await setDefaultGroupSendingOn(env, groupId);
+  // First make the normal group baseline permissive for sending.
+  // Per-user restrictions are what block non-allowlisted users.
+  try {
+    await setDefaultGroupSendingOn(env, groupId);
+  } catch (error) {
+    throw new Error(
+      `Could not enable group default sending: ${safeError(error)}`
+    );
+  }
 
-  // Directly check EVERY globally allowed ID against Telegram.
-  // This works even if the bot never cached that member previously.
-  for (const userId of allowedIds) {
-    try {
+  // Enable every allowed ID in parallel. This does not depend on known_members.
+  const allowedResults = await Promise.allSettled(
+    allowedIds.map(async userId => {
       const member = await getChatMember(env, groupId, userId);
 
       if (!memberIsPresent(member)) {
-        continue;
+        return { enabled: false, absent: true };
       }
 
-      if (member.status === "creator" || member.status === "administrator") {
+      if (
+        member.status === "creator" ||
+        member.status === "administrator"
+      ) {
         if (member.user) {
           await rememberUser(env, groupId, member.user);
         }
-        continue;
+        return { enabled: false, admin: true };
       }
 
-      await allowUser(env, groupId, member.user || { id: userId }, actorUserId);
-      enabled += 1;
-    } catch (error) {
-      // Not in this group yet, or Telegram cannot resolve it here.
-      // Keep it in the global table. Join handling will grant access later.
-      console.log(
-        `Allowed ID ${userId} is not currently active in group ${groupId}:`,
-        safeError(error)
+      await allowUser(
+        env,
+        groupId,
+        member.user || { id: userId },
+        actorUserId
       );
+
+      // Verify Telegram actually removed the send restriction.
+      const verified = await getChatMember(env, groupId, userId);
+
+      const canSend =
+        verified.status === "member" ||
+        verified.status === "creator" ||
+        verified.status === "administrator" ||
+        (
+          verified.status === "restricted" &&
+          verified.is_member === true &&
+          verified.can_send_messages === true
+        );
+
+      if (!canSend) {
+        throw new Error(
+          `Telegram still reports user ${userId} as unable to send`
+        );
+      }
+
+      return { enabled: true };
+    })
+  );
+
+  for (let i = 0; i < allowedResults.length; i += 1) {
+    const result = allowedResults[i];
+
+    if (result.status === "fulfilled") {
+      if (result.value.enabled) enabled += 1;
+    } else {
+      // USER_NOT_PARTICIPANT / user not found is normal for IDs that have not
+      // joined this particular group yet. Keep the global ID for future joins.
+      const msg = safeError(result.reason);
+
+      if (
+        !/user not found|participant|not a member|USER_NOT_PARTICIPANT/i.test(msg)
+      ) {
+        errors.push(`allow ${allowedIds[i]}: ${msg}`);
+      }
     }
   }
 
-  // IDs removed from the master list must lose posting access immediately
-  // if they are current normal members.
-  for (const userId of removedIds) {
-    try {
+  // IDs removed from the master list should lose access immediately.
+  const removedResults = await Promise.allSettled(
+    removedIds.map(async userId => {
       const member = await getChatMember(env, groupId, userId);
 
-      if (!memberIsPresent(member)) continue;
-      if (member.status === "creator" || member.status === "administrator") continue;
+      if (!memberIsPresent(member)) return false;
+      if (
+        member.status === "creator" ||
+        member.status === "administrator"
+      ) return false;
 
-      await restrictUser(env, groupId, userId, "removed_from_global_allowlist");
+      await restrictUser(
+        env,
+        groupId,
+        userId,
+        "removed_from_global_allowlist"
+      );
+
+      return true;
+    })
+  );
+
+  for (const result of removedResults) {
+    if (result.status === "fulfilled" && result.value) {
       restricted += 1;
-    } catch {}
+    }
   }
 
-  // Also restrict every known normal member not present in the global table.
+  // Restrict known non-allowlisted normal members.
+  // Do this after allowed users have already been restored.
   const known = await getKnownMembersWithGlobalState(env, groupId);
 
   for (const row of known) {
@@ -447,12 +538,26 @@ async function syncGroupPermissions(
     try {
       if (await isTelegramAdmin(env, groupId, userId)) continue;
 
-      await restrictUser(env, groupId, userId, "global_allowlist_enforcement");
-      restricted += 1;
-    } catch {}
+      if (
+        await restrictUser(
+          env,
+          groupId,
+          userId,
+          "global_allowlist_enforcement"
+        )
+      ) {
+        restricted += 1;
+      }
+    } catch (error) {
+      errors.push(`restrict ${userId}: ${safeError(error)}`);
+    }
   }
 
-  return { enabled, restricted };
+  return {
+    enabled,
+    restricted,
+    errors,
+  };
 }
 
 async function handleJoinedUser(env, chat, user) {
@@ -797,10 +902,33 @@ async function allowUser(env, groupId, user, actorUserId) {
 
   if (!userId) return false;
 
+  // Telegram's documented way to fully lift a member restriction is to pass
+  // TRUE for all ChatPermissions fields. Once the individual restriction is
+  // lifted, the group's normal default permissions apply.
+  //
+  // This is safer than leaving a few fields false, which keeps the account in
+  // ChatMemberRestricted state and can leave sending disabled on some clients.
+  const liftAllRestrictions = {
+    can_send_messages: true,
+    can_send_audios: true,
+    can_send_documents: true,
+    can_send_photos: true,
+    can_send_videos: true,
+    can_send_video_notes: true,
+    can_send_voice_notes: true,
+    can_send_polls: true,
+    can_send_other_messages: true,
+    can_add_web_page_previews: true,
+    can_change_info: true,
+    can_invite_users: true,
+    can_pin_messages: true,
+    can_manage_topics: true,
+  };
+
   await tg(env, "restrictChatMember", {
     chat_id: groupId,
     user_id: userId,
-    permissions: allowedSendPermissions(),
+    permissions: liftAllRestrictions,
     use_independent_chat_permissions: true,
   });
 
